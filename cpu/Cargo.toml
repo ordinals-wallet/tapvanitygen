@@ -1,0 +1,16 @@
+[package]
+name = "tapvanitygen"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rayon = "1.8.0"
+bitcoin = { version = "0.31.1", features = ["rand"] }
+rand = "*"
+clap = { version = "4.4.18", features = ["derive"] }
+
+[provider.dev]
+opt-level = 3
+overflow-checks = false

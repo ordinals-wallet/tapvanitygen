@@ -12,3 +12,6 @@ wallet_*.json
 
 # OS
 .DS_Store
+
+# cpu miner build
+cpu/target/
