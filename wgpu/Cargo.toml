@@ -1,0 +1,26 @@
+[package]
+name = "tapvanity-wgpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-platform GPU taproot (P2TR / bc1p) vanity address miner (Rust + wgpu)"
+repository = ""
+
+[[bin]]
+name = "tapvanity-wgpu"
+path = "src/main.rs"
+
+[lib]
+name = "tapvanity_wgpu"
+path = "src/lib.rs"
+
+[dependencies]
+wgpu = "22.1"
+pollster = "0.3"
+bytemuck = { version = "1.14", features = ["derive"] }
+bitcoin = { version = "0.31.1", features = ["rand"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true

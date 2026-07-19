@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taproot Vanity Miner (WebGPU)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem; min-height: 100vh;
+    background: #0d1117; color: #e6edf3;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 760px; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .sub { color: #8b949e; font-size: .85rem; margin-bottom: 1.2rem; }
+  .privacy {
+    background: #10381f; border: 1px solid #2ea043; border-radius: 8px;
+    padding: .8rem 1rem; margin: 1rem 0; font-size: 1rem; font-weight: 700; color: #7ee787;
+  }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  label { display: block; font-size: .8rem; color: #8b949e; margin-bottom: .25rem; }
+  input[type=text] {
+    width: 100%; padding: .55rem .7rem; border-radius: 6px; border: 1px solid #30363d;
+    background: #0d1117; color: #e6edf3; font: inherit; font-size: 1rem;
+  }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 200px; }
+  button {
+    font: inherit; padding: .55rem 1.4rem; border-radius: 6px; border: 1px solid #30363d;
+    background: #238636; color: #fff; cursor: pointer; font-weight: 700;
+  }
+  button.stop { background: #da3633; }
+  button.copy { background: #21262d; padding: .25rem .7rem; font-size: .8rem; font-weight: 400; }
+  button:disabled { opacity: .5; cursor: default; }
+  .stats { display: flex; gap: 2rem; margin-top: 1rem; font-size: .95rem; }
+  .stats b { color: #58a6ff; font-size: 1.2rem; }
+  .stats span { display: block; color: #8b949e; font-size: .75rem; }
+  #status { margin-top: .8rem; color: #8b949e; font-size: .85rem; min-height: 1.2em; }
+  #error { color: #ff7b72; white-space: pre-wrap; }
+  .result { border-color: #2ea043; }
+  .field { margin: .7rem 0; }
+  .field .val {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    padding: .5rem .7rem; word-break: break-all; font-size: .9rem; margin-top: .25rem;
+    display: flex; justify-content: space-between; gap: .6rem; align-items: flex-start;
+  }
+  .warn { background: #3a2d12; border: 1px solid #bb8009; border-radius: 8px; padding: .7rem 1rem; font-size: .85rem; color: #e3b341; margin-top: .8rem; }
+  .hidden { display: none; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Taproot Vanity Miner &mdash; WebGPU</h1>
+  <div class="sub">GPU-accelerated bc1p&hellip; (P2TR rawtr) vanity address search, entirely in your browser.</div>
+
+  <div class="privacy">Keys are generated locally in your browser and never transmitted.</div>
+
+  <div id="nogpu" class="card hidden">
+    <b>WebGPU is not supported in this browser.</b>
+    <p>You need Chrome 113+ or Edge 113+ (WebGPU enabled by default), or Safari Technology
+    Preview. On Linux or Firefox you may need to enable a flag
+    (<code>chrome://flags/#enable-unsafe-webgpu</code> / <code>dom.webgpu.enabled</code>).</p>
+  </div>
+
+  <div id="ui" class="card">
+    <div class="row">
+      <div>
+        <label for="prefix">Prefix (after <code>bc1p</code>) &mdash; bech32 chars only: <code>qpzry9x8gf2tvdw0s3jn54khce6mua7l</code></label>
+        <input id="prefix" type="text" placeholder="e.g. frog" spellcheck="false" autocomplete="off">
+      </div>
+      <div>
+        <label for="suffix">Suffix (end of address, incl. checksum region)</label>
+        <input id="suffix" type="text" placeholder="optional" spellcheck="false" autocomplete="off">
+      </div>
+    </div>
+    <div style="margin-top:1rem; display:flex; gap:.8rem; align-items:center;">
+      <button id="start">Start mining</button>
+      <button id="stop" class="stop" disabled>Stop</button>
+    </div>
+    <div class="stats">
+      <div><b id="rate">0</b><span>keys / sec</span></div>
+      <div><b id="tried">0</b><span>keys tried</span></div>
+      <div><b id="elapsed">0s</b><span>elapsed</span></div>
+    </div>
+    <div id="status"></div>
+    <div id="error"></div>
+  </div>
+
+  <div id="result" class="card result hidden">
+    <b style="color:#7ee787">Verified match found</b>
+    <div class="field"><label>Address</label>
+      <div class="val"><span id="rAddr"></span><button class="copy" data-for="rAddr">Copy</button></div></div>
+    <div class="field"><label>Private key (WIF, compressed)</label>
+      <div class="val"><span id="rWif"></span><button class="copy" data-for="rWif">Copy</button></div></div>
+    <div class="field"><label>Descriptor</label>
+      <div class="val"><span id="rDesc"></span><button class="copy" data-for="rDesc">Copy</button></div></div>
+    <div class="warn"><b>Wallet compatibility:</b> this is a <b>rawtr descriptor key</b> &mdash;
+      import into Bitcoin Core as <code>rawtr(&lt;WIF&gt;)</code>; most wallets expecting
+      <code>tr()</code> will <b>NOT</b> derive this address from this key.</div>
+    <div class="warn"><b>Security:</b> the private key is displayed in your browser. Handle it
+      carefully &mdash; avoid screen sharing, clear your clipboard after use, and consider
+      running this page offline.</div>
+  </div>
+</main>
+
+<script src="secp256k1.js"></script>
+<script src="miner.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+if (!navigator.gpu) {
+  $("nogpu").classList.remove("hidden");
+  $("start").disabled = true;
+}
+
+let running = false;
+
+$("start").onclick = async () => {
+  const prefixStr = $("prefix").value.trim();
+  const suffixStr = $("suffix").value.trim();
+  $("error").textContent = "";
+  $("result").classList.add("hidden");
+  let prefix, suffix;
+  try {
+    prefix = patternTo5bit(prefixStr);
+    suffix = patternTo5bit(suffixStr);
+    if (prefix.length === 0 && suffix.length === 0) throw new Error("enter a prefix and/or suffix");
+    if (prefix.length > 32 || suffix.length > 32) throw new Error("pattern too long (max 32)");
+  } catch (e) { $("error").textContent = String(e.message || e); return; }
+
+  $("start").disabled = true; $("stop").disabled = false;
+  running = true;
+  $("status").textContent = "Initializing WebGPU…";
+
+  try {
+    const miner = await Miner.create({ prefix, suffix, threadgroups: 64, iters: 64 });
+    $("status").textContent = `GPU: ${miner.adapterInfo || "adapter"} — building tables…`;
+    await miner.prepare();
+    $("status").textContent = "Mining (fast/rawtr mode)…";
+
+    let tried = 0, iterBase = 0;
+    const t0 = performance.now();
+    let lastT = t0, lastTried = 0;
+
+    while (running) {
+      const hit = await miner.searchOnce(iterBase);
+      iterBase += miner.iters;
+      tried += miner.keysPerLaunch();
+      const now = performance.now();
+      if (now - lastT > 250) {
+        $("rate").textContent = Math.round((tried - lastTried) / ((now - lastT) / 1000)).toLocaleString();
+        $("tried").textContent = tried.toLocaleString();
+        $("elapsed").textContent = Math.round((now - t0) / 1000) + "s";
+        lastT = now; lastTried = tried;
+      }
+      if (hit) {
+        const v = verifyHit(hit, prefixStr, suffixStr); // throws if not verified
+        $("rAddr").textContent = v.address;
+        $("rWif").textContent = v.wif;
+        $("rDesc").textContent = v.descriptor;
+        $("result").classList.remove("hidden");
+        $("status").textContent = `Found & verified after ${tried.toLocaleString()} keys.`;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 0)); // yield to UI
+    }
+    if (running === false && $("result").classList.contains("hidden")) {
+      $("status").textContent = "Stopped.";
+    }
+  } catch (e) {
+    $("error").textContent = "Error: " + (e.message || e);
+    $("status").textContent = "";
+  } finally {
+    running = false;
+    $("start").disabled = false; $("stop").disabled = true;
+  }
+};
+
+$("stop").onclick = () => { running = false; };
+
+document.addEventListener("click", e => {
+  if (e.target.classList && e.target.classList.contains("copy")) {
+    const txt = $(e.target.dataset.for).textContent;
+    navigator.clipboard.writeText(txt).then(() => {
+      e.target.textContent = "Copied";
+      setTimeout(() => e.target.textContent = "Copy", 1200);
+    });
+  }
+});
+</script>
+</body>
+</html>

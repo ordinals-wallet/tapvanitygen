@@ -1,0 +1,14 @@
+# Rust
+/wgpu/target
+/metal/verify/target
+
+# Metal build artifacts
+/metal/build
+
+# scratch / logs
+*.log
+/tmp
+wallet_*.json
+
+# OS
+.DS_Store

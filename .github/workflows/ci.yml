@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  wgpu-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: wgpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wgpu
+      # GPU compute tests need a real adapter, which CI runners usually lack.
+      # They are gated behind TAPVANITY_SKIP_GPU: with it set, the GPU tests
+      # soft-skip (return early) and only the pure-CPU scalar test runs, so the
+      # build + non-GPU logic are still exercised on every push.
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Test (GPU tests soft-skipped on headless runners)
+        env:
+          TAPVANITY_SKIP_GPU: "1"
+        run: cargo test --release --verbose
+
+  rust-verify-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: metal/verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the metal miner's Rust reference verifier
+        run: cargo build --release

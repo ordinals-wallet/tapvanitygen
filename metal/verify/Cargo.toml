@@ -1,0 +1,14 @@
+[package]
+name = "tapverify"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tapverify"
+path = "src/main.rs"
+
+[dependencies]
+bitcoin = { version = "0.31.1", features = ["rand"] }
+
+[profile.release]
+opt-level = 3
