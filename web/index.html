@@ -137,39 +137,35 @@ $("start").onclick = async () => {
   running = true;
   $("status").textContent = "Initializing WebGPU…";
 
+  let lastT = 0;
   try {
-    const miner = await Miner.create({ prefix, suffix, threadgroups: 64, iters: 64 });
-    $("status").textContent = `GPU: ${miner.adapterInfo || "adapter"} — building tables…`;
-    await miner.prepare();
-    $("status").textContent = "Mining (fast/rawtr mode)…";
-
-    let tried = 0, iterBase = 0;
-    const t0 = performance.now();
-    let lastT = t0, lastTried = 0;
-
-    while (running) {
-      const hit = await miner.searchOnce(iterBase);
-      iterBase += miner.iters;
-      tried += miner.keysPerLaunch();
-      const now = performance.now();
-      if (now - lastT > 250) {
-        $("rate").textContent = Math.round((tried - lastTried) / ((now - lastT) / 1000)).toLocaleString();
-        $("tried").textContent = tried.toLocaleString();
-        $("elapsed").textContent = Math.round((now - t0) / 1000) + "s";
-        lastT = now; lastTried = tried;
-      }
-      if (hit) {
-        const v = verifyHit(hit, prefixStr, suffixStr); // throws if not verified
-        $("rAddr").textContent = v.address;
-        $("rWif").textContent = v.wif;
-        $("rDesc").textContent = v.descriptor;
-        $("result").classList.remove("hidden");
-        $("status").textContent = `Found & verified after ${tried.toLocaleString()} keys.`;
-        break;
-      }
-      await new Promise(r => setTimeout(r, 0)); // yield to UI
-    }
-    if (running === false && $("result").classList.contains("hidden")) {
+    // Adaptive driver: short launches sized to a wall-time budget, and
+    // automatic recovery if the GPU device is lost (WebKit watchdog).
+    const out = await Miner.mine({
+      prefix: prefixStr,
+      suffix: suffixStr,
+      onReady: ({ adapter, threadgroups }) => {
+        $("status").textContent = `GPU: ${adapter || "adapter"} (${threadgroups} wg) — mining…`;
+      },
+      onProgress: ({ tried, rate, elapsed }) => {
+        const now = performance.now();
+        if (now - lastT > 250) {
+          $("rate").textContent = Math.round(rate).toLocaleString();
+          $("tried").textContent = Math.round(tried).toLocaleString();
+          $("elapsed").textContent = Math.round(elapsed) + "s";
+          lastT = now;
+        }
+      },
+      onDiag: (msg) => { $("status").textContent = msg; },
+      shouldStop: () => !running,
+    });
+    if (out && out.found) {
+      $("rAddr").textContent = out.found.address;
+      $("rWif").textContent = out.found.wif;
+      $("rDesc").textContent = out.found.descriptor;
+      $("result").classList.remove("hidden");
+      $("status").textContent = `Found & verified after ${Math.round(out.tried).toLocaleString()} keys.`;
+    } else {
       $("status").textContent = "Stopped.";
     }
   } catch (e) {
