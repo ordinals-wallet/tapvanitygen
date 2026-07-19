@@ -7,7 +7,7 @@ targets that share the same verified secp256k1 + BIP-341 + bech32m pipeline:
 |---|---|---|---|
 | **Metal** (fastest) | [`metal/`](metal/) | macOS, Apple Silicon | ~15 MK/s standard, ~180 MK/s fast |
 | **wgpu** (portable) | [`wgpu/`](wgpu/) | Windows / Linux / macOS, any Vulkan/DX12/Metal GPU | ~1.5 MK/s standard, ~4 MK/s fast |
-| **Browser** (zero-install) | [`web/`](web/) | Chrome/Edge (WebGPU), fast mode only | see [Browser](#browser) |
+| **Browser** (zero-install) | [`web/`](web/) | Chrome/Edge (WebGPU), fast mode only | ~6 MK/s (Chrome, M3 Max) |
 
 All three mine mainnet **P2TR key-path** addresses (BIP-341, no script tree):
 output key `Q = P + TapTweak(P.x)·G`, address `= bech32m("bc", 1, Q.x)`. Every
@@ -137,13 +137,19 @@ parities). See each subdirectory's README for details.
 ## Browser
 
 The `web/` target is a framework-free static page (one HTML + one JS host + the
-shared WGSL + a vendored secp256k1) that runs the same `search_fast` kernel via
-the browser's native WebGPU API. It mines fast/rawtr only, verifies every find
-in-browser before display, and shows live keys/sec. Browser GPU compute is
-slower than the native binaries and depends on the browser's WGSL compiler
-(Dawn/Tint on Chrome); see `web/README` and the in-repo notes for measured
-speed and support caveats. WebGPU support: Chrome/Edge 113+ (stable), Safari
-Technology Preview, Firefox behind `dom.webgpu.enabled`.
+shared WGSL + a vendored BigInt secp256k1) that runs the same `search_fast`
+kernel via the browser's native WebGPU API. It mines fast/rawtr only, verifies
+every find in-browser (recomputes the pubkey → x-only → bech32m from the found
+key and only displays matches) before display, and shows live keys/sec.
+
+Measured **~6 MK/s in Chrome on an M3 Max** — slower than the native binaries
+(browser GPU compute + the Tint WGSL compiler), but zero-install. Actual speed
+depends on the browser and GPU. WebGPU support: Chrome/Edge 113+ (stable),
+Safari Technology Preview, Firefox behind `dom.webgpu.enabled`. The page shows
+a clear "WebGPU not supported" message with guidance when unavailable, and a
+prominent "keys are generated locally and never transmitted" notice. Because it
+is a single self-contained page with no runtime network calls, it drops cleanly
+into any static host.
 
 ## Repository layout
 
