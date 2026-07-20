@@ -198,7 +198,55 @@ fn fe_mul(pa: Fe, pb: Fe) -> Fe {
     return fe_reduce512(t);
 }
 
-fn fe_sqr(a: Fe) -> Fe { return fe_mul(a, a); }
+// Dedicated squaring gate. Per-pipeline override: the safe pipeline compiles
+// with USE_FAST_SQR=false (fe_mul squaring, proven on every compiler); the
+// optimized pipeline may compile with true. A miscompile in a given browser's
+// WGSL compiler is contained to the fast pipeline and recovered by safe-mode.
+override USE_FAST_SQR: bool = false;
+
+// Schoolbook squaring: 36 half-limb partial products instead of 64. Off-diagonal
+// products summed once then doubled, diagonal squares added. Faster than the
+// generic multiply but historically miscompiled on some backends (Metal/naga),
+// hence the runtime gate.
+fn fe_sqr_fast(pa: Fe) -> Fe {
+    var a = pa;
+    var t: array<u32,16>;
+    for (var i = 0u; i < 16u; i = i + 1u) { t[i] = 0u; }
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        var carry = 0u;
+        for (var j = i + 1u; j < 8u; j = j + 1u) {
+            let m = mul32(a[i], a[j]);
+            let s1 = addc(t[i + j], m.x, 0u);
+            let s2 = addc(s1.x, carry, 0u);
+            t[i + j] = s2.x;
+            carry = m.y + s1.y + s2.y;
+        }
+        t[i + 8u] = carry;
+    }
+    // double the accumulated off-diagonal sum across 512 bits
+    var top = 0u;
+    for (var i = 0u; i < 16u; i = i + 1u) {
+        let nt = (t[i] << 1u) | top;
+        top = t[i] >> 31u;
+        t[i] = nt;
+    }
+    // add the diagonal squares a[i]^2
+    var c = 0u;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let sq = mul32(a[i], a[i]);
+        let d0 = addc(t[2u * i], sq.x, c);
+        t[2u * i] = d0.x;
+        let d1 = addc(t[2u * i + 1u], sq.y, d0.y);
+        t[2u * i + 1u] = d1.x;
+        c = d1.y;
+    }
+    return fe_reduce512(t);
+}
+
+fn fe_sqr(a: Fe) -> Fe {
+    if (USE_FAST_SQR) { return fe_sqr_fast(a); }
+    return fe_mul(a, a);
+}
 
 fn fe_is_ge_p(a: Fe) -> bool {
     // compare a >= p

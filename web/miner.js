@@ -1,20 +1,68 @@
-// miner.js — WebGPU host for the tap_vanity.wgsl kernel (fast/rawtr mode).
-// Mirrors the Rust wgpu host (wgpu/src/lib.rs): same bind group layout,
-// buffer structs, and dispatch order (init_table -> setup -> search_fast loop).
+// miner.js — WebGPU host for tap_vanity.wgsl (standard + fast modes).
+// Mirrors the Rust wgpu host layout; adds WebKit/iOS resilience, runtime-
+// selectable optimizations, per-tier self-test gating, and structured logging.
 //
-// WebKit/iOS resilience:
-//   * Each search launch is sized ADAPTIVELY toward a wall-time budget
-//     (~80ms) instead of a fixed desktop size. A giant single dispatch trips
-//     WebKit's GPU watchdog, which loses the device and rejects every pending
-//     mapAsync with "map async was not successful" — the exact iOS bug.
-//   * requestDevice asks for no exotic limits; the 256-wide workgroup is
-//     verified against adapter limits up front.
-//   * device.lost + uncapturederror are wired to diagnostics; a lost device is
-//     recovered by Miner.mine() by recreating at half the workgroup count.
+// Resilience model (three suspect WGSL compilers: Tint/Chrome, naga/Firefox,
+// WebKit/Safari — the standard path has miscompiled on all three at times):
+//   * Adaptive launch sizing toward a wall-time budget so no dispatch trips a
+//     GPU watchdog (device-lost → mapAsync rejects).
+//   * Two kernel TIERS: "fast" (search_opt = batched inversion, optional
+//     dedicated fe_sqr) and "safe" (search = unbatched, fe_mul squaring, the
+//     shape proven on every compiler). Each optimization is individually
+//     disableable; safe = all off.
+//   * Every tier is gated by a k=1 known-vector self-test BEFORE real mining,
+//     and every find is re-verified; a failure at either point escalates to
+//     the next (safer) tier with a friendly message.
+//   * Structured [cheekyminer] logger records everything needed to diagnose a
+//     field failure from a pasted log — NEVER private-key material.
 
 "use strict";
 
 const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const KNOWN_K1_ADDR =
+  "bc1pmfr3p9j00pfxjh0zmgp99y8zftmd3s5pmedqhyptwy6lm87hf5sspknck9";
+// (legacy) batched-kernel alignment; the batched kernel was reverted.
+const OPT_BATCH = 4;
+
+// ------------------------------------------------------------- structured logger
+// A ring buffer + console mirror. Key material is never passed in, by design,
+// so dump() is always safe to paste publicly.
+const CheekyLog = (() => {
+  const buf = [];
+  const MAX = 600;
+  function line(level, event, data) {
+    const ts = (performance.now() / 1000).toFixed(2);
+    let s = `[cheekyminer] ${ts}s ${level} ${event}`;
+    if (data !== undefined) {
+      s += " " + (typeof data === "string" ? data : safeJson(data));
+    }
+    buf.push(s);
+    if (buf.length > MAX) buf.shift();
+    const fn = level === "ERR" ? console.error : level === "WARN" ? console.warn : console.log;
+    try { fn(s); } catch (_) { /* ignore */ }
+    return s;
+  }
+  function safeJson(o) {
+    try { return JSON.stringify(o); } catch (_) { return String(o); }
+  }
+  return {
+    info: (e, d) => line("INFO", e, d),
+    warn: (e, d) => line("WARN", e, d),
+    err: (e, d) => line("ERR", e, d),
+    dump: () => buf.join("\n"),
+    clear: () => { buf.length = 0; },
+  };
+})();
+
+function detectCompiler() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  if (/Firefox\//.test(ua)) return "naga (Firefox)";
+  if (/Edg\//.test(ua)) return "Tint (Edge)";
+  if (/Chrome\/|Chromium\//.test(ua)) return "Tint (Chrome)";
+  if (/Safari\//.test(ua) && /Version\//.test(ua)) return "WebKit (Safari)";
+  if (/AppleWebKit\//.test(ua)) return "WebKit";
+  return "unknown";
+}
 
 function patternTo5bit(s) {
   const out = [];
@@ -27,102 +75,104 @@ function patternTo5bit(s) {
 }
 
 class Miner {
-  // cfg: { prefix:[5bit], suffix:[5bit], threadgroups, wgslUrl,
-  //        frameBudgetMs?, startIters?, maxIters?, onDiag? }
+  // cfg: { prefix:[5bit], suffix:[5bit], mode, kernel, fastSqr, threadgroups,
+  //        wgslUrl, frameBudgetMs?, startIters?, maxIters?, k0?, log? }
   static async create(cfg) {
+    const log = cfg.log || CheekyLog;
     if (!navigator.gpu) throw new Error("WebGPU not supported");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter available");
 
-    // The kernel is hard-coded to @workgroup_size(256). Every spec-compliant
-    // device guarantees 256, but check so we fail loud instead of at pipeline
-    // creation if some device reports lower.
     const lim = adapter.limits;
     if (lim.maxComputeInvocationsPerWorkgroup < 256 || lim.maxComputeWorkgroupSizeX < 256) {
       throw new Error("this GPU can't run a 256-wide compute kernel (limits too low)");
     }
-
-    // No exotic limits requested — defaults are plenty (largest buffer is a
-    // few MB) and asking for more can fail on WebKit.
     const device = await adapter.requestDevice({ label: "tapvanity" });
 
     const m = new Miner();
     m.device = device;
     m._lost = null;
+    m.log = log;
     m._onDiag = cfg.onDiag || (() => {});
 
-    // Surface GPU trouble instead of letting it vanish into a rejected promise.
     device.lost.then((info) => {
       m._lost = info;
-      m._onDiag(`device lost: ${info.reason || "unknown"} ${info.message || ""}`.trim());
+      log.err("device-lost-event", { reason: info.reason || "unknown", message: (info.message || "").slice(0, 100) });
+      m._onDiag(`device lost: ${info.reason || "unknown"}`.trim());
     });
     try {
       device.addEventListener("uncapturederror", (ev) => {
+        log.err("uncaptured-error", { message: String(ev.error && ev.error.message).slice(0, 140) });
         m._onDiag(`gpu error: ${ev.error.message}`);
-        // eslint-disable-next-line no-console
-        console.error("[tapvanity] uncaptured GPU error:", ev.error);
       });
-    } catch (_) { /* older impls: no addEventListener on device */ }
+    } catch (_) { /* older impls */ }
 
-    // mode: "standard" (BIP-341 internal key + on-GPU tweak; the key imports
-    // into Unisat/OKX/Xverse as a normal Taproot key) or "fast" (rawtr output
-    // key). Standard is ~4x slower but wallet-compatible.
     m.mode = cfg.mode === "fast" ? "fast" : "standard";
+    m.kernel = cfg.kernel || (m.mode === "fast" ? "search_fast" : "search");
+    m.fastSqr = !!cfg.fastSqr;
+    m.batchSize = m.kernel === "search_opt" ? OPT_BATCH : 1;
+    m._batchAlign = m.batchSize;
 
     const maxDim = lim.maxComputeWorkgroupsPerDimension || 65535;
     m.threadgroups = Math.max(1, Math.min(cfg.threadgroups || 64, maxDim));
     m.totalThreads = m.threadgroups * 256;
     m.frameBudgetMs = cfg.frameBudgetMs || 80;
     m.maxIters = cfg.maxIters || 1024;
-    m._iters = Math.max(1, cfg.startIters || 2); // iters for the NEXT launch
-    m.iters = m._iters;                          // iters used by the LAST launch
+    m._iters = Math.max(m._batchAlign, Math.round((cfg.startIters || m._batchAlign) / m._batchAlign) * m._batchAlign);
+    m.iters = m._iters;
     m._iterBase = 0;
     m.prefixLen = cfg.prefix.length;
     m.suffixLen = cfg.suffix.length;
     m.adapterInfo = adapter.info
-      ? `${adapter.info.vendor || ""} ${adapter.info.architecture || ""} ${adapter.info.description || ""}`.trim()
-      : "unknown";
+      ? `${adapter.info.vendor || ""} ${adapter.info.architecture || ""} ${adapter.info.description || ""}`.trim() || "adapter"
+      : "adapter";
+    m.limitsInfo = {
+      maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+      maxBufferSize: lim.maxBufferSize,
+      maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
+    };
 
     const wgslSrc = await (await fetch(cfg.wgslUrl || "tap_vanity.wgsl")).text();
     const module = device.createShaderModule({ code: wgslSrc });
 
-    // k0: random 256-bit, reduced mod n
-    const rnd = new Uint8Array(32);
-    crypto.getRandomValues(rnd);
-    m.k0 = SECP.mod(SECP.bytesToBig(rnd), SECP.N);
+    // k0
+    if (cfg.k0 !== undefined) {
+      m.k0 = SECP.mod(BigInt(cfg.k0), SECP.N);
+      if (m.k0 === 0n) m.k0 = 1n;
+    } else {
+      const rnd = new Uint8Array(32);
+      crypto.getRandomValues(rnd);
+      m.k0 = SECP.mod(SECP.bytesToBig(rnd), SECP.N);
+      if (m.k0 === 0n) m.k0 = 1n;
+    }
 
-    // ----- buffers (layout mirrors lib.rs) -----
     const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
     m.tableBuf = device.createBuffer({ label: "table", size: 32 * 256 * 16 * 4, usage: S });
     m.stateBuf = device.createBuffer({ label: "state", size: m.totalThreads * 24 * 4, usage: S });
 
-    // Cfg: prefix_len, suffix_len, fast, total_threads, prefix[32], suffix[32]
     const cfgArr = new Uint32Array(68);
     cfgArr[0] = m.prefixLen;
     cfgArr[1] = m.suffixLen;
-    cfgArr[2] = m.mode === "fast" ? 1 : 0; // fast flag (kernels are split, but keep it truthful)
+    cfgArr[2] = m.mode === "fast" ? 1 : 0;
     cfgArr[3] = m.totalThreads;
     cfg.prefix.forEach((v, i) => (cfgArr[4 + i] = v));
     cfg.suffix.forEach((v, i) => (cfgArr[36 + i] = v));
     m.cfgBuf = device.createBuffer({ label: "cfg", size: cfgArr.byteLength, usage: S | CD });
     device.queue.writeBuffer(m.cfgBuf, 0, cfgArr);
 
-    // Params: k0[8] (LE u32 limbs), iter_base, iters, _p0, _p1
     const params = new Uint32Array(12);
     let k = m.k0;
     for (let i = 0; i < 8; i++) { params[i] = Number(k & 0xffffffffn); k >>= 32n; }
-    params[8] = 0;         // iter_base
-    params[9] = m._iters;  // iters
+    params[8] = 0;
+    params[9] = m._iters;
     m.paramsBuf = device.createBuffer({ label: "params", size: params.byteLength, usage: S | CD });
     device.queue.writeBuffer(m.paramsBuf, 0, params);
-    m._paramScratch = new Uint32Array(2); // [iter_base, iters], written at offset 32
+    m._paramScratch = new Uint32Array(2);
 
-    // Found: flag, tid, iter, parity, tweak[8], qx[8] = 20 u32
     m.FOUND_SIZE = 20 * 4;
     m.foundBuf = device.createBuffer({ label: "found", size: m.FOUND_SIZE, usage: S | CD | CS });
     m.foundRead = device.createBuffer({ label: "found_read", size: m.FOUND_SIZE, usage: GPUBufferUsage.MAP_READ | CD });
 
-    // ----- bind group: 5 storage buffers, group(0) -----
     const bgl = device.createBindGroupLayout({
       entries: [0, 1, 2, 3, 4].map((i) => ({
         binding: i,
@@ -141,10 +191,17 @@ class Miner {
       ],
     });
     const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-    const mk = (entryPoint) => device.createComputePipeline({ label: entryPoint, layout, compute: { module, entryPoint } });
-    m.initPipeline = mk("init_table");
-    m.setupPipeline = mk("setup");
-    m.searchPipeline = mk(m.mode === "fast" ? "search_fast" : "search");
+    // init_table / setup always use the proven (fe_mul) squaring; the dedicated
+    // squaring override only ever touches the search pipeline, so a fastSqr
+    // miscompile can't corrupt the window table (which the self-test trusts).
+    m.initPipeline = device.createComputePipeline({ label: "init_table", layout, compute: { module, entryPoint: "init_table" } });
+    m.setupPipeline = device.createComputePipeline({ label: "setup", layout, compute: { module, entryPoint: "setup" } });
+    const searchConstants = (m.kernel === "search" || m.kernel === "search_opt")
+      ? { USE_FAST_SQR: m.fastSqr ? 1 : 0 }
+      : {};
+    m.searchPipeline = device.createComputePipeline({
+      label: m.kernel, layout, compute: { module, entryPoint: m.kernel, constants: searchConstants },
+    });
     return m;
   }
 
@@ -158,17 +215,15 @@ class Miner {
     this.device.queue.submit([enc.finish()]);
   }
 
-  // Build window table and per-thread start points. Call once.
   async prepare() {
-    this.dispatch(this.initPipeline, (32 * 256) / 256); // 32 workgroups
+    const t = performance.now();
+    this.dispatch(this.initPipeline, (32 * 256) / 256);
     await this.device.queue.onSubmittedWorkDone();
     this.dispatch(this.setupPipeline, this.threadgroups);
     await this.device.queue.onSubmittedWorkDone();
+    this.prepMs = +(performance.now() - t).toFixed(1);
   }
 
-  // One adaptive search launch. Measures wall time and re-sizes the NEXT
-  // launch toward frameBudgetMs so no single dispatch runs long enough to trip
-  // a GPU watchdog. Returns { hit, keys } where keys is this launch's count.
   async searchStep() {
     const iters = this._iters;
     this._paramScratch[0] = this._iterBase >>> 0;
@@ -183,11 +238,7 @@ class Miner {
     try {
       await this.foundRead.mapAsync(GPUMapMode.READ);
     } catch (e) {
-      // WebKit rejects with "map async was not successful" when the device was
-      // lost mid-dispatch (watchdog). Tag it so the driver can recover smaller.
-      const err = new Error(
-        `GPU dispatch failed (device lost / watchdog): ${e && e.message ? e.message : e}`,
-      );
+      const err = new Error(`GPU dispatch failed (device lost / watchdog): ${e && e.message ? e.message : e}`);
       err.deviceLost = true;
       throw err;
     }
@@ -197,28 +248,27 @@ class Miner {
 
     const keys = this.totalThreads * iters;
     this._iterBase += iters;
-    this.iters = iters; // record for keysPerLaunch()/display
+    this.iters = iters;
 
-    // Adapt for next launch: nudge toward the budget, clamped to avoid wild
-    // swings and to keep any one dispatch bounded.
+    // adapt next launch toward the wall-time budget, aligned to batch size
     if (dt > 0) {
       const scale = Math.max(0.5, Math.min(2, this.frameBudgetMs / dt));
-      this._iters = Math.max(1, Math.min(this.maxIters, Math.round(iters * scale) || 1));
+      let next = Math.round((iters * scale) / this._batchAlign) * this._batchAlign;
+      next = Math.max(this._batchAlign, Math.min(this.maxIters, next || this._batchAlign));
+      this._iters = next;
     }
 
     if (found[0] === 0) {
-      // iter lives in one 32-bit lane per thread; keep it well inside range.
       if (this._iterBase >= 0x7fff0000) {
         const err = new Error("search space exhausted for this session — start again");
         err.exhausted = true;
         throw err;
       }
-      return { hit: null, keys };
+      return { hit: null, keys, dt };
     }
-    return { hit: this.reconstruct(found), keys };
+    return { hit: this.reconstruct(found), keys, dt };
   }
 
-  // Back-compat single-launch API (fixed iters); prefer searchStep()/mine().
   async searchOnce(iterBase) {
     if (typeof iterBase === "number") this._iterBase = iterBase >>> 0;
     const { hit } = await this.searchStep();
@@ -229,18 +279,14 @@ class Miner {
     const tid = BigInt(found[1]);
     const iter = BigInt(found[2]);
     const kRaw = SECP.mod(this.k0 + (tid << 32n) + iter, SECP.N);
-    // GPU-reported Q.x (LE u32 limbs) for cross-check
     let gpuX = 0n;
     for (let i = 7; i >= 0; i--) gpuX = (gpuX << 32n) | BigInt(found[12 + i]);
 
     if (this.mode === "fast") {
-      // fast: GPU reports no parity; normalize to even-y output key
       const pub = SECP.pubkey(kRaw);
       const k = pub.parityOdd ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
       return { mode: "fast", key: k, gpuX, tid: found[1], iter: found[2] };
     }
-    // standard: GPU reports the y-parity of the internal point P and the
-    // TapTweak scalar. Negate the internal secret to the even-y convention.
     const parity = found[3] & 1;
     const internal = parity ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
     let gpuTweak = 0n;
@@ -250,117 +296,205 @@ class Miner {
 
   keysPerLaunch() { return this.totalThreads * this.iters; }
 
-  destroy() {
-    try { this.device.destroy(); } catch (_) { /* ignore */ }
+  destroy() { try { this.device.destroy(); } catch (_) { /* ignore */ } }
+
+  // k=1 known-vector check for a given tier. Returns {ok, reason}. Mines with
+  // k0=1 and the known address prefix so a compiler miscompile is caught in the
+  // very first launch (instant), before any real mining begins.
+  static async selfCheck(cfg) {
+    const log = cfg.log || CheekyLog;
+    let miner = null;
+    try {
+      miner = await Miner.create({
+        prefix: patternTo5bit(KNOWN_K1_ADDR.slice(4, 12)), // "mfr3p9j0"
+        suffix: [], mode: "standard", kernel: cfg.kernel, fastSqr: cfg.fastSqr,
+        threadgroups: 1, wgslUrl: cfg.wgslUrl, k0: 1n,
+        startIters: cfg.kernel === "search_opt" ? OPT_BATCH : 4, log,
+      });
+      await miner.prepare();
+      // a couple of launches in case the batch needs to sweep past iter 0
+      for (let i = 0; i < 3; i++) {
+        const { hit } = await miner.searchStep();
+        if (hit) {
+          const res = verifyHit(hit, "", "", log);
+          if (res.address !== KNOWN_K1_ADDR) return { ok: false, reason: `k1 address ${res.address}` };
+          return { ok: true };
+        }
+      }
+      return { ok: false, reason: "k=1 vector not reproduced" };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    } finally {
+      try { miner && miner.destroy(); } catch (_) { /* ignore */ }
+    }
   }
 
-  // High-level driver: create + prepare + adaptive search loop, with automatic
-  // recovery from a lost device by rebuilding at a smaller workgroup count.
-  // opts: { prefix?, suffix, wgslUrl, threadgroups?, frameBudgetMs?,
-  //         onReady?({adapter,threadgroups}), onProgress?({tried,rate,elapsed,iters}),
-  //         onDiag?(msg), shouldStop?() }
-  // Returns { found:{address,wif,descriptor}, tried, rate, elapsed } or
-  //         { stopped:true }.
+  // High-level driver. opts: { prefix?, suffix, mode?, fastSqr?, forceSafe?,
+  //   wgslUrl, threadgroups?, frameBudgetMs?, onReady?, onProgress?, onDiag?,
+  //   shouldStop?, log? }
+  // Returns { found, tried, rate, elapsed, tier } or { stopped:true }.
   static async mine(opts) {
+    const log = opts.log || CheekyLog;
+    const compiler = detectCompiler();
     const prefix5 = patternTo5bit(opts.prefix || "");
     const suffix5 = patternTo5bit(opts.suffix || "");
     const mode = opts.mode === "fast" ? "fast" : "standard";
-    let threadgroups = opts.threadgroups || 64;
+    const diag = (msg) => opts.onDiag && opts.onDiag(msg);
+
+    // Kernel tiers, most-optimized first; each is gated by the k=1 self-test so
+    // a compiler that miscompiles a tier is detected before real mining and
+    // escalates to the next (safer) one.
+    //
+    // The kept optimization is the dedicated fe_sqr (schoolbook squaring) on the
+    // proven `search` kernel — isolated arithmetic, low compiler risk. (A batched
+    // Montgomery-inversion kernel was tried but miscompiled on Tint/Chrome — the
+    // k=1 self-test reproduced nothing — so it was reverted.)
+    const optFastSqr = opts.fastSqr !== false; // default: try dedicated squaring
+    const tiers = mode === "fast"
+      ? [{ name: "fast", kernel: "search_fast", fastSqr: false }]
+      : [
+          { name: "fast", kernel: "search", fastSqr: optFastSqr },
+          { name: "safe", kernel: "search", fastSqr: false },
+        ];
+    let tierIdx = opts.forceSafe ? tiers.length - 1 : 0;
+
     const t0 = performance.now();
     let totalTried = 0;
-    const diag = opts.onDiag || (() => {});
+    let lastRateLog = -1e9;
 
-    for (let attempt = 0; ; attempt++) {
-      let miner = null;
-      try {
-        miner = await Miner.create({
-          prefix: prefix5,
-          suffix: suffix5,
-          mode,
-          threadgroups,
-          wgslUrl: opts.wgslUrl,
-          frameBudgetMs: opts.frameBudgetMs,
-          onDiag: diag,
-        });
-        opts.onReady?.({ adapter: miner.adapterInfo, threadgroups });
-        await miner.prepare();
+    log.info("startup", {
+      compiler, ua: ((navigator && navigator.userAgent) || "").slice(0, 140),
+      mode, target: { prefix: opts.prefix || "", suffix: opts.suffix || "" },
+    });
 
-        for (;;) {
-          if (opts.shouldStop?.()) return { stopped: true };
-          const { hit, keys } = await miner.searchStep();
-          totalTried += keys;
-          const elapsed = (performance.now() - t0) / 1000;
-          const rate = elapsed > 0 ? totalTried / elapsed : 0;
-          opts.onProgress?.({ tried: totalTried, rate, elapsed, iters: miner.iters });
-          if (hit) {
-            const res = verifyHit(hit, opts.prefix || "", opts.suffix || "");
-            const el = (performance.now() - t0) / 1000;
-            return { found: res, tried: totalTried, rate: el > 0 ? totalTried / el : 0, elapsed: el };
+    tierLoop:
+    for (; tierIdx < tiers.length; tierIdx++) {
+      const tier = tiers[tierIdx];
+
+      // ---- per-tier self-test gate ----
+      log.info("selftest-begin", { tier: tier.name, kernel: tier.kernel, fastSqr: tier.fastSqr });
+      const sc = await Miner.selfCheck({ kernel: tier.kernel, fastSqr: tier.fastSqr, wgslUrl: opts.wgslUrl, log });
+      if (!sc.ok) {
+        log.err("selftest-fail", { tier: tier.name, reason: sc.reason, compiler });
+        if (tierIdx < tiers.length - 1) { diag("self-test failed — switching to safe mode"); continue tierLoop; }
+        throw new Error(`GPU self-test failed even in safe mode (${compiler}): ${sc.reason}`);
+      }
+      log.info("selftest-ok", { tier: tier.name });
+
+      // ---- mine this tier, with device-loss shrink recovery ----
+      let threadgroups = opts.threadgroups || 64;
+      for (let attempt = 0; ; attempt++) {
+        let miner = null;
+        try {
+          miner = await Miner.create({
+            prefix: prefix5, suffix: suffix5, mode, kernel: tier.kernel, fastSqr: tier.fastSqr,
+            threadgroups, wgslUrl: opts.wgslUrl, frameBudgetMs: opts.frameBudgetMs, log,
+            onDiag: opts.onDiag,
+          });
+          log.info("miner-ready", {
+            tier: tier.name, kernel: tier.kernel, fastSqr: tier.fastSqr, batch: miner.batchSize,
+            threadgroups, adapter: miner.adapterInfo, limits: miner.limitsInfo, compiler,
+          });
+          opts.onReady && opts.onReady({
+            adapter: miner.adapterInfo, threadgroups, compiler, tier: tier.name,
+            kernel: tier.kernel, fastSqr: tier.fastSqr, batch: miner.batchSize,
+          });
+          await miner.prepare();
+          log.info("prepared", { tier: tier.name, prepMs: miner.prepMs });
+
+          for (;;) {
+            if (opts.shouldStop && opts.shouldStop()) {
+              log.info("stopped", { tried: Math.round(totalTried) });
+              return { stopped: true };
+            }
+            const { hit, keys, dt } = await miner.searchStep();
+            totalTried += keys;
+            const elapsed = (performance.now() - t0) / 1000;
+            const rate = elapsed > 0 ? totalTried / elapsed : 0;
+            opts.onProgress && opts.onProgress({ tried: totalTried, rate, elapsed, iters: miner.iters });
+            if (elapsed - lastRateLog >= 5) {
+              lastRateLog = elapsed;
+              log.info("rate", {
+                tried: Math.round(totalTried), mkps: +(rate / 1e6).toFixed(3),
+                launchKeys: keys, iters: miner.iters, dtMs: +dt.toFixed(1), tier: tier.name,
+              });
+            }
+            if (hit) {
+              try {
+                const res = verifyHit(hit, opts.prefix || "", opts.suffix || "", log);
+                const el = (performance.now() - t0) / 1000;
+                log.info("found", {
+                  address: res.address, tried: Math.round(totalTried),
+                  mkps: +(totalTried / Math.max(el, 1e-9) / 1e6).toFixed(3),
+                  elapsedS: +el.toFixed(1), tier: tier.name,
+                });
+                return { found: res, tried: totalTried, rate: totalTried / Math.max(el, 1e-9), elapsed: el, tier: tier.name };
+              } catch (ve) {
+                log.err("verify-fail-runtime", { reason: String(ve.message || ve).slice(0, 120), tier: tier.name, compiler });
+                if (tierIdx < tiers.length - 1) {
+                  diag("hiccup — switching to safe mode");
+                  continue tierLoop; // finally destroys miner, tierLoop increments
+                }
+                diag("mining failed verification even in safe mode");
+                throw ve;
+              }
+            }
           }
+        } catch (e) {
+          const msg = String((e && e.message) || e);
+          const recoverable = (e && e.deviceLost) || /device.*lost|map async|destroyed/i.test(msg);
+          if (recoverable && threadgroups > 8 && attempt < 6) {
+            threadgroups = Math.max(8, Math.floor(threadgroups / 2));
+            log.warn("device-lost", { msg: msg.slice(0, 80), retryThreadgroups: threadgroups, tier: tier.name });
+            diag(`GPU hiccup — retrying smaller (${threadgroups} workgroups)`);
+            await new Promise((r) => setTimeout(r, 250));
+            continue; // inner attempt loop
+          }
+          log.err("fatal", { msg: msg.slice(0, 140), tier: tier.name });
+          throw e;
+        } finally {
+          try { miner && miner.destroy(); } catch (_) { /* ignore */ }
         }
-      } catch (e) {
-        const msg = String((e && e.message) || e);
-        const recoverable =
-          (e && e.deviceLost) || /device.*lost|map async|destroyed/i.test(msg);
-        if (recoverable && threadgroups > 8 && attempt < 5) {
-          threadgroups = Math.max(8, Math.floor(threadgroups / 2));
-          diag(`GPU hiccup — retrying smaller (${threadgroups} workgroups)`);
-          await new Promise((r) => setTimeout(r, 250));
-          continue;
-        }
-        throw e;
-      } finally {
-        try { miner?.destroy(); } catch (_) { /* ignore */ }
       }
     }
+    throw new Error("no viable kernel tier");
   }
 }
 
-// Verify a reconstructed key against the pattern; returns full result or throws.
-// Only verified results are ever shown to the user.
-function verifyHit(hit, prefixStr, suffixStr) {
-  const matches = (address) => {
-    const body = address.slice(4); // after "bc1p"
-    if (prefixStr && !body.startsWith(prefixStr))
-      throw new Error(`verification failed: ${address} does not start with bc1p${prefixStr}`);
-    if (suffixStr && !address.endsWith(suffixStr))
-      throw new Error(`verification failed: ${address} does not end with ${suffixStr}`);
+// Verify a reconstructed key; returns the display result or throws (tagged
+// .verifyFail). Logs each sub-check pass/fail. NEVER logs key material.
+function verifyHit(hit, prefixStr, suffixStr, log) {
+  log = log || CheekyLog;
+  const fail = (reason) => { const e = new Error("verification failed: " + reason); e.verifyFail = true; throw e; };
+  const checkPattern = (address, label) => {
+    const body = address.slice(4);
+    if (prefixStr && !body.startsWith(prefixStr)) { log.err("vcheck", { check: label + "-prefix", ok: false }); fail(`${address} !startswith bc1p${prefixStr}`); }
+    if (suffixStr && !address.endsWith(suffixStr)) { log.err("vcheck", { check: label + "-suffix", ok: false }); fail(`${address} !endswith ${suffixStr}`); }
+    log.info("vcheck", { check: label + "-pattern", ok: true });
   };
 
   if (hit.mode === "fast") {
-    const pub = SECP.pubkey(hit.key); // must be even-y now
-    if (pub.parityOdd) throw new Error("verification failed: normalized key still has odd-y pubkey");
-    if (pub.xBig !== hit.gpuX) throw new Error("verification failed: CPU pubkey.x != GPU-reported x (WGSL compiler bug?)");
+    const pub = SECP.pubkey(hit.key);
+    if (pub.parityOdd) { log.err("vcheck", { check: "fast-eveny", ok: false }); fail("normalized key still odd-y"); }
+    if (pub.xBig !== hit.gpuX) { log.err("vcheck", { check: "fast-gpux", ok: false }); fail("CPU pubkey.x != GPU x (compiler bug?)"); }
+    log.info("vcheck", { check: "fast-gpux", ok: true });
     const address = SECP.bech32mP2TR(pub.x);
-    matches(address);
+    checkPattern(address, "fast");
     const wif = SECP.wif(hit.key);
     return { mode: "fast", address, wif, descriptor: `rawtr(${wif})` };
   }
 
-  // STANDARD: the exported key is the BIP-341 INTERNAL key. We prove two things
-  // before display:
-  //  (a) internal key + TapTweak derives the mined address (matches GPU Q.x);
-  //  (b) the wallet path — BIP-86 tweak of the imported key's pubkey — derives
-  //      the SAME address (this is exactly what Unisat/OKX/Xverse compute).
-  // (a) and (b) are the same computation (taprootFromInternalPriv), so one
-  // verified derivation proves the wallet-import claim; we also cross-check the
-  // GPU-reported tweak against the CPU tweak for GPU/CPU integrity.
+  // standard: prove internal+TapTweak == GPU Q.x, cross-check tweak, and
+  // independently simulate the wallet (BIP-86) import path.
   const t = SECP.taprootFromInternalPriv(hit.internal);
-  if (t.qxBig !== hit.gpuX)
-    throw new Error("verification failed: CPU output-key.x != GPU-reported Q.x (WGSL compiler bug?)");
-  if (t.tweak !== hit.gpuTweak)
-    throw new Error("verification failed: CPU TapTweak != GPU-reported tweak");
-  matches(t.address); // (a) our derivation
-  // (b) simulate the wallet import path independently from the WIF's key.
+  if (t.qxBig !== hit.gpuX) { log.err("vcheck", { check: "std-gpu-qx", ok: false }); fail("CPU output-key.x != GPU-reported Q.x (compiler bug?)"); }
+  log.info("vcheck", { check: "std-gpu-qx", ok: true });
+  if (t.tweak !== hit.gpuTweak) { log.err("vcheck", { check: "std-tweak", ok: false }); fail("CPU TapTweak != GPU-reported tweak"); }
+  log.info("vcheck", { check: "std-tweak", ok: true });
+  checkPattern(t.address, "std");
   const walletAddr = SECP.taprootFromInternalPriv(t.internalEven).address;
-  if (walletAddr !== t.address)
-    throw new Error("verification failed: wallet BIP-86 path address mismatch");
-  matches(walletAddr);
-  const wif = SECP.wif(t.internalEven); // even-y internal key = what wallets import
-  return {
-    mode: "standard",
-    address: t.address,
-    wif,
-    tweakedSecret: t.outputSecret.toString(16).padStart(64, "0"),
-  };
+  if (walletAddr !== t.address) { log.err("vcheck", { check: "std-wallet-sim", ok: false }); fail("wallet BIP-86 path address mismatch"); }
+  log.info("vcheck", { check: "std-wallet-sim", ok: true });
+  const wif = SECP.wif(t.internalEven);
+  return { mode: "standard", address: t.address, wif, tweakedSecret: t.outputSecret.toString(16).padStart(64, "0") };
 }
