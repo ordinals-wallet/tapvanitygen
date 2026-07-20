@@ -23,6 +23,8 @@ const KNOWN_K1_ADDR =
   "bc1pmfr3p9j00pfxjh0zmgp99y8zftmd3s5pmedqhyptwy6lm87hf5sspknck9";
 // (legacy) batched-kernel alignment; the batched kernel was reverted.
 const OPT_BATCH = 4;
+// 16-bit window table: 16 windows x 65536 entries x 16 u32 = 64 MB.
+const WIDE_TABLE_BYTES = 16 * 65536 * 16 * 4;
 
 // ------------------------------------------------------------- structured logger
 // A ring buffer + console mirror. Key material is never passed in, by design,
@@ -110,6 +112,13 @@ class Miner {
     m.mode = cfg.mode === "fast" ? "fast" : "standard";
     m.kernel = cfg.kernel || (m.mode === "fast" ? "search_fast" : "search");
     m.fastSqr = !!cfg.fastSqr;
+    m.wide = m.kernel === "search_wide";
+    if (m.wide && lim.maxStorageBufferBindingSize < WIDE_TABLE_BYTES) {
+      device.destroy();
+      const e = new Error(`device can't bind the 64MB wide table (maxStorageBufferBindingSize=${lim.maxStorageBufferBindingSize})`);
+      e.wideUnsupported = true;
+      throw e;
+    }
     m.batchSize = m.kernel === "search_opt" ? OPT_BATCH : 1;
     m._batchAlign = m.batchSize;
 
@@ -173,30 +182,40 @@ class Miner {
     m.foundBuf = device.createBuffer({ label: "found", size: m.FOUND_SIZE, usage: S | CD | CS });
     m.foundRead = device.createBuffer({ label: "found_read", size: m.FOUND_SIZE, usage: GPUBufferUsage.MAP_READ | CD });
 
+    // Wide config binds the 64 MB 16-bit table at binding 5; layout entries a
+    // given pipeline doesn't use are permitted, so one layout serves them all.
+    const bindings = m.wide ? [0, 1, 2, 3, 4, 5] : [0, 1, 2, 3, 4];
+    if (m.wide) {
+      m.wtableBuf = device.createBuffer({ label: "wtable", size: WIDE_TABLE_BYTES, usage: S });
+    }
     const bgl = device.createBindGroupLayout({
-      entries: [0, 1, 2, 3, 4].map((i) => ({
+      entries: bindings.map((i) => ({
         binding: i,
         visibility: GPUShaderStage.COMPUTE,
         buffer: { type: (i === 1 || i === 4) ? "read-only-storage" : "storage" },
       })),
     });
-    m.bindGroup = device.createBindGroup({
-      layout: bgl,
-      entries: [
-        { binding: 0, resource: { buffer: m.tableBuf } },
-        { binding: 1, resource: { buffer: m.cfgBuf } },
-        { binding: 2, resource: { buffer: m.foundBuf } },
-        { binding: 3, resource: { buffer: m.stateBuf } },
-        { binding: 4, resource: { buffer: m.paramsBuf } },
-      ],
-    });
+    const bgEntries = [
+      { binding: 0, resource: { buffer: m.tableBuf } },
+      { binding: 1, resource: { buffer: m.cfgBuf } },
+      { binding: 2, resource: { buffer: m.foundBuf } },
+      { binding: 3, resource: { buffer: m.stateBuf } },
+      { binding: 4, resource: { buffer: m.paramsBuf } },
+    ];
+    if (m.wide) bgEntries.push({ binding: 5, resource: { buffer: m.wtableBuf } });
+    m.bindGroup = device.createBindGroup({ layout: bgl, entries: bgEntries });
     const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
     // init_table / setup always use the proven (fe_mul) squaring; the dedicated
     // squaring override only ever touches the search pipeline, so a fastSqr
     // miscompile can't corrupt the window table (which the self-test trusts).
     m.initPipeline = device.createComputePipeline({ label: "init_table", layout, compute: { module, entryPoint: "init_table" } });
     m.setupPipeline = device.createComputePipeline({ label: "setup", layout, compute: { module, entryPoint: "setup" } });
-    const searchConstants = (m.kernel === "search" || m.kernel === "search_opt")
+    if (m.wide) {
+      m.initWidePipeline = device.createComputePipeline({
+        label: "init_table_wide", layout, compute: { module, entryPoint: "init_table_wide" },
+      });
+    }
+    const searchConstants = (m.kernel === "search" || m.kernel === "search_wide")
       ? { USE_FAST_SQR: m.fastSqr ? 1 : 0 }
       : {};
     m.searchPipeline = device.createComputePipeline({
@@ -219,6 +238,13 @@ class Miner {
     const t = performance.now();
     this.dispatch(this.initPipeline, (32 * 256) / 256);
     await this.device.queue.onSubmittedWorkDone();
+    if (this.wide) {
+      // 16*65536 entries, built from the (already-complete) 8-bit table.
+      // One entry = at most 2 mixed adds + 1 affine inversion; a single
+      // 4096-workgroup dispatch is ~1M entries of bounded work.
+      this.dispatch(this.initWidePipeline, (16 * 65536) / 256);
+      await this.device.queue.onSubmittedWorkDone();
+    }
     this.dispatch(this.setupPipeline, this.threadgroups);
     await this.device.queue.onSubmittedWorkDone();
     this.prepMs = +(performance.now() - t).toFixed(1);
@@ -291,7 +317,7 @@ class Miner {
     const internal = parity ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
     let gpuTweak = 0n;
     for (let i = 7; i >= 0; i--) gpuTweak = (gpuTweak << 32n) | BigInt(found[4 + i]);
-    return { mode: "standard", internal, gpuTweak, gpuX, tid: found[1], iter: found[2] };
+    return { mode: "standard", internal, gpuTweak, gpuX, parity, tid: found[1], iter: found[2] };
   }
 
   keysPerLaunch() { return this.totalThreads * this.iters; }
@@ -329,6 +355,38 @@ class Miner {
     }
   }
 
+  // Short timed benchmark of one tier config. Mines a fixed astronomically-
+  // unlikely pattern (so nothing real can be found mid-benchmark) for a couple
+  // of warmup launches plus ~1.2s of measurement; returns { mkps, prepMs }.
+  static async benchTier(tier, opts, log) {
+    let miner = null;
+    try {
+      miner = await Miner.create({
+        prefix: patternTo5bit("qqqqqqqq"), suffix: [], mode: "standard",
+        kernel: tier.kernel, fastSqr: tier.fastSqr,
+        threadgroups: opts.threadgroups || 64, wgslUrl: opts.wgslUrl,
+        frameBudgetMs: opts.frameBudgetMs, log,
+      });
+      await miner.prepare();
+      for (let i = 0; i < 3; i++) await miner.searchStep(); // warmup + calibration
+      let keys = 0;
+      const t0 = performance.now();
+      while (performance.now() - t0 < 1200) {
+        const r = await miner.searchStep();
+        keys += r.keys;
+      }
+      const dt = (performance.now() - t0) / 1000;
+      const mkps = +(keys / dt / 1e6).toFixed(3);
+      log.info("bench-tier", { tier: tier.name, kernel: tier.kernel, fastSqr: tier.fastSqr, mkps, prepMs: miner.prepMs });
+      return { mkps, prepMs: miner.prepMs };
+    } catch (e) {
+      log.warn("bench-tier-fail", { tier: tier.name, reason: String((e && e.message) || e).slice(0, 100) });
+      return { mkps: 0, prepMs: 0 };
+    } finally {
+      try { miner && miner.destroy(); } catch (_) { /* ignore */ }
+    }
+  }
+
   // High-level driver. opts: { prefix?, suffix, mode?, fastSqr?, forceSafe?,
   //   wgslUrl, threadgroups?, frameBudgetMs?, onReady?, onProgress?, onDiag?,
   //   shouldStop?, log? }
@@ -345,17 +403,48 @@ class Miner {
     // a compiler that miscompiles a tier is detected before real mining and
     // escalates to the next (safer) one.
     //
-    // The kept optimization is the dedicated fe_sqr (schoolbook squaring) on the
-    // proven `search` kernel — isolated arithmetic, low compiler risk. (A batched
-    // Montgomery-inversion kernel was tried but miscompiled on Tint/Chrome — the
-    // k=1 self-test reproduced nothing — so it was reverted.)
+    // Optimizations: (1) 16-bit "wide" window table (64 MB, capability-gated
+    // AND runtime-benchmarked — on bandwidth-starved mobile GPUs a big table
+    // can be SLOWER even when it fits, so wide only wins its slot by measuring
+    // faster than the 8-bit table on THIS device); (2) dedicated fe_sqr on the
+    // proven `search` shape. Safe = all off. (A batched Montgomery-inversion
+    // kernel was tried but miscompiled on Tint/Chrome — reverted.)
     const optFastSqr = opts.fastSqr !== false; // default: try dedicated squaring
-    const tiers = mode === "fast"
+    const tryWide = mode !== "fast" && opts.wide !== false && !opts.forceSafe;
+    let tiers = mode === "fast"
       ? [{ name: "fast", kernel: "search_fast", fastSqr: false }]
       : [
           { name: "fast", kernel: "search", fastSqr: optFastSqr },
           { name: "safe", kernel: "search", fastSqr: false },
         ];
+
+    if (tryWide) {
+      // Wide is admitted to the tier list only if it (a) passes the k=1
+      // self-test and (b) measures faster than the narrow fast tier here and
+      // now. Both measured rates are logged so field logs answer what phones do.
+      const wideTier = { name: "wide", kernel: "search_wide", fastSqr: optFastSqr };
+      log.info("wide-selftest-begin", { kernel: "search_wide", fastSqr: optFastSqr });
+      const wsc = await Miner.selfCheck({ kernel: "search_wide", fastSqr: optFastSqr, wgslUrl: opts.wgslUrl, log });
+      if (!wsc.ok) {
+        log.warn("wide-rejected", { stage: "selftest", reason: wsc.reason, compiler });
+      } else {
+        log.info("wide-selftest-ok", {});
+        const narrowTier = tiers[0];
+        const [wideBench, narrowBench] = [
+          await Miner.benchTier(wideTier, opts, log),
+          await Miner.benchTier(narrowTier, opts, log),
+        ];
+        const decision =
+          wideBench.mkps > 0 && wideBench.mkps > narrowBench.mkps * 1.03 ? "wide" : "narrow";
+        log.info("table-decision", {
+          chosen: decision,
+          wideMkps: wideBench.mkps, narrowMkps: narrowBench.mkps,
+          widePrepMs: wideBench.prepMs, narrowPrepMs: narrowBench.prepMs,
+          compiler,
+        });
+        if (decision === "wide") tiers = [wideTier, ...tiers];
+      }
+    }
     let tierIdx = opts.forceSafe ? tiers.length - 1 : 0;
 
     const t0 = performance.now();
@@ -424,7 +513,7 @@ class Miner {
                 const res = verifyHit(hit, opts.prefix || "", opts.suffix || "", log);
                 const el = (performance.now() - t0) / 1000;
                 log.info("found", {
-                  address: res.address, tried: Math.round(totalTried),
+                  address: res.address, parity: hit.parity, tried: Math.round(totalTried),
                   mkps: +(totalTried / Math.max(el, 1e-9) / 1e6).toFixed(3),
                   elapsedS: +el.toFixed(1), tier: tier.name,
                 });

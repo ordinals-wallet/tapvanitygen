@@ -421,6 +421,40 @@ fn table_y(idx: u32) -> Fe {
     return r;
 }
 
+// ---- optional 16-bit window table (Pass B, capability-gated) ----
+// wtable[w*65536+v] = (v * 2^(16w)) * G for w in 0..16, v in 0..65535.
+// 16*65536 entries * 16 u32 = 64 MB; bound only when the device can take it.
+// Flat single-dimension indexing throughout (Tint miscompiles dynamic-indexed
+// arrays-of-arrays; plain flat storage-buffer indexing is the proven pattern).
+@group(0) @binding(5) var<storage, read_write> wtable: array<u32>;
+
+fn wtable_x(idx: u32) -> Fe {
+    var r: Fe;
+    let base = idx * 16u;
+    for (var i = 0u; i < 8u; i = i + 1u) { r[i] = wtable[base + i]; }
+    return r;
+}
+fn wtable_y(idx: u32) -> Fe {
+    var r: Fe;
+    let base = idx * 16u + 8u;
+    for (var i = 0u; i < 8u; i = i + 1u) { r[i] = wtable[base + i]; }
+    return r;
+}
+
+// scalar*G via 16-bit windows: 16 mixed adds instead of 32.
+fn scalarmult_base_wide(ps: Fe) -> Jac {
+    var s = ps;
+    var p = Jac(fe_zero(), fe_zero(), fe_zero(), 1u);
+    for (var w = 0u; w < 16u; w = w + 1u) {
+        let limb = s[w / 2u];
+        let v = (limb >> ((w % 2u) * 16u)) & 0xffffu;
+        if (v == 0u) { continue; }
+        let idx = w * 65536u + v;
+        p = jac_madd(p, wtable_x(idx), wtable_y(idx));
+    }
+    return p;
+}
+
 // scalar*G via 8-bit window table: table[b*256+v] = (v*256^b)*G
 fn scalarmult_base(ps: Fe) -> Jac {
     var s = ps;
@@ -648,6 +682,36 @@ fn init_table(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < 8u; i = i + 1u) { table[base + 8u + i] = aff.y[i]; }
 }
 
+// Builds the 16-bit table FROM the 8-bit table (must run after init_table):
+// v*(2^16w)*G = lo*(256^(2w))*G + hi*(256^(2w+1))*G — one mixed add of two
+// 8-bit entries plus one affine conversion per entry. Grid: 16*65536 threads.
+@compute @workgroup_size(256)
+fn init_table_wide(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let id = gid.x;
+    if (id >= 16u * 65536u) { return; }
+    let w = id / 65536u;
+    let v = id % 65536u;
+    let base = id * 16u;
+    if (v == 0u) {
+        for (var i = 0u; i < 16u; i = i + 1u) { wtable[base + i] = 0u; }
+        return;
+    }
+    let lo = v & 0xffu;
+    let hi = v >> 8u;
+    var p = Jac(fe_zero(), fe_zero(), fe_zero(), 1u);
+    if (lo != 0u) {
+        let ilo = (2u * w) * 256u + lo;
+        p = jac_madd(p, table_x(ilo), table_y(ilo));
+    }
+    if (hi != 0u) {
+        let ihi = (2u * w + 1u) * 256u + hi;
+        p = jac_madd(p, table_x(ihi), table_y(ihi));
+    }
+    let aff = jac_to_affine(p);
+    for (var i = 0u; i < 8u; i = i + 1u) { wtable[base + i] = aff.x[i]; }
+    for (var i = 0u; i < 8u; i = i + 1u) { wtable[base + 8u + i] = aff.y[i]; }
+}
+
 fn fe_ge_n(pa: Fe) -> bool {
     var a = pa; var nn = N;
     for (var i = 8u; i > 0u; i = i - 1u) {
@@ -731,6 +795,44 @@ fn search(@builtin(global_invocation_id) gid: vec3<u32>) {
         let parity = aff.y[0] & 1u;
         let tw = taptweak(aff.x);
         var q = scalarmult_base(tw);
+        var pyeven = aff.y;
+        if (parity != 0u) { pyeven = fe_neg_norm(aff.y); }
+        q = jac_madd(q, aff.x, pyeven);
+        let qx = jac_to_affine_x(q);
+        let v = bech32m_values(qx);
+        if (check_pattern(v)) {
+            report(tid, it, parity, tw, qx);
+            return;
+        }
+
+        // step P += G
+        j = jac_madd(j, gx, gy);
+
+        if ((it & 15u) == 15u && atomicLoad(&found.flag) != 0u) { break; }
+    }
+    store_state(tid, j);
+}
+
+// WIDE-table standard search — identical shape to `search` (the codegen-proven
+// pattern), differing only in scalarmult_base_wide (16 adds vs 32). Separate
+// entry point so its codegen is isolated, per the naga/Tint lessons.
+@compute @workgroup_size(256)
+fn search_wide(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    if (tid >= cfg.total_threads) { return; }
+    if (atomicLoad(&found.flag) != 0u) { return; }
+
+    var j = load_state(tid);
+    var gx: Fe; var gy: Fe;
+    var GXv = GX; var GYv = GY;
+    for (var i = 0u; i < 8u; i = i + 1u) { gx[i] = GXv[i]; gy[i] = GYv[i]; }
+
+    let iters = params.iters;
+    for (var it = 0u; it < iters; it = it + 1u) {
+        let aff = jac_to_affine(j);
+        let parity = aff.y[0] & 1u;
+        let tw = taptweak(aff.x);
+        var q = scalarmult_base_wide(tw);
         var pyeven = aff.y;
         if (parity != 0u) { pyeven = fe_neg_norm(aff.y); }
         q = jac_madd(q, aff.x, pyeven);
