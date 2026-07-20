@@ -77,9 +77,14 @@
         <input id="suffix" type="text" placeholder="optional" spellcheck="false" autocomplete="off">
       </div>
     </div>
-    <div style="margin-top:1rem; display:flex; gap:.8rem; align-items:center;">
+    <div style="margin-top:1rem; display:flex; gap:.8rem; align-items:center; flex-wrap:wrap;">
       <button id="start">Start mining</button>
       <button id="stop" class="stop" disabled>Stop</button>
+      <label style="display:flex; gap:.4rem; align-items:center; font-size:.9rem;">
+        <input id="fast" type="checkbox">
+        fast / rawtr mode (~4&times; faster, but the key imports as a
+        <code>rawtr()</code> descriptor, not a normal Taproot key)
+      </label>
     </div>
     <div class="stats">
       <div><b id="rate">0</b><span>keys / sec</span></div>
@@ -96,11 +101,9 @@
       <div class="val"><span id="rAddr"></span><button class="copy" data-for="rAddr">Copy</button></div></div>
     <div class="field"><label>Private key (WIF, compressed)</label>
       <div class="val"><span id="rWif"></span><button class="copy" data-for="rWif">Copy</button></div></div>
-    <div class="field"><label>Descriptor</label>
+    <div class="field" id="rDescRow"><label>Descriptor</label>
       <div class="val"><span id="rDesc"></span><button class="copy" data-for="rDesc">Copy</button></div></div>
-    <div class="warn"><b>Wallet compatibility:</b> this is a <b>rawtr descriptor key</b> &mdash;
-      import into Bitcoin Core as <code>rawtr(&lt;WIF&gt;)</code>; most wallets expecting
-      <code>tr()</code> will <b>NOT</b> derive this address from this key.</div>
+    <div class="warn" id="modeNote"></div>
     <div class="warn"><b>Security:</b> the private key is displayed in your browser. Handle it
       carefully &mdash; avoid screen sharing, clear your clipboard after use, and consider
       running this page offline.</div>
@@ -141,9 +144,11 @@ $("start").onclick = async () => {
   try {
     // Adaptive driver: short launches sized to a wall-time budget, and
     // automatic recovery if the GPU device is lost (WebKit watchdog).
+    const mode = $("fast").checked ? "fast" : "standard";
     const out = await Miner.mine({
       prefix: prefixStr,
       suffix: suffixStr,
+      mode,
       onReady: ({ adapter, threadgroups }) => {
         $("status").textContent = `GPU: ${adapter || "adapter"} (${threadgroups} wg) — mining…`;
       },
@@ -162,7 +167,20 @@ $("start").onclick = async () => {
     if (out && out.found) {
       $("rAddr").textContent = out.found.address;
       $("rWif").textContent = out.found.wif;
-      $("rDesc").textContent = out.found.descriptor;
+      if (out.found.mode === "fast") {
+        $("rDescRow").style.display = "";
+        $("rDesc").textContent = out.found.descriptor;
+        $("modeNote").innerHTML =
+          "<b>Wallet compatibility:</b> this is a <b>rawtr descriptor key</b> — " +
+          "import into Bitcoin Core as <code>rawtr(&lt;WIF&gt;)</code>; most wallets " +
+          "expecting <code>tr()</code> will <b>NOT</b> derive this address from this key.";
+      } else {
+        $("rDescRow").style.display = "none";
+        $("modeNote").innerHTML =
+          "<b>Import as Taproot:</b> add the WIF to Unisat / OKX / Xverse / Bitcoin Core " +
+          "as a normal Taproot (BIP-86) key — it derives exactly this address. " +
+          "(Advanced: tweaked key-path secret <code>" + out.found.tweakedSecret + "</code>.)";
+      }
       $("result").classList.remove("hidden");
       $("status").textContent = `Found & verified after ${Math.round(out.tried).toLocaleString()} keys.`;
     } else {

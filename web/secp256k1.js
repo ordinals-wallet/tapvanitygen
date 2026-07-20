@@ -148,6 +148,40 @@ const SECP = (() => {
     return out;
   }
 
+  // ---------------- BIP-341 / BIP-86 taproot tweak ----------------
+  // Tagged hash: SHA256( SHA256(tag) || SHA256(tag) || msg ).
+  function taggedHash(tag, msg) {
+    const t = sha256(new TextEncoder().encode(tag));
+    const buf = new Uint8Array(t.length * 2 + msg.length);
+    buf.set(t, 0); buf.set(t, t.length); buf.set(msg, t.length * 2);
+    return sha256(buf);
+  }
+  // TapTweak scalar t = int(taggedHash("TapTweak", P.x)) mod n  (key-path only,
+  // no script tree — exactly what BIP-86 wallets apply to an imported key).
+  function taptweak(xonly32) {
+    return mod(bytesToBig(taggedHash("TapTweak", xonly32)), N);
+  }
+  // Given an INTERNAL private key d, return the BIP-86 taproot output: the same
+  // address Unisat/OKX/Xverse/Bitcoin Core derive when the key is imported as a
+  // Taproot key. Normalizes d to the even-y (x-only) convention first.
+  function taprootFromInternalPriv(dPriv) {
+    let d = mod(dPriv, N);
+    let P = mulG(d);
+    if (!P) throw new Error("infinity");
+    if ((P[1] & 1n) === 1n) { d = mod(N - d, N); P = mulG(d); } // even-y
+    const xonly = bigToBytes32(P[0]);
+    const t = taptweak(xonly);
+    const Q = add(P, mulG(t));
+    if (!Q) throw new Error("tweak produced infinity");
+    return {
+      address: bech32mP2TR(bigToBytes32(Q[0])),
+      qxBig: Q[0],
+      tweak: t,
+      internalEven: d,          // even-y internal secret (what the WIF encodes)
+      outputSecret: mod(d + t, N), // key-path signing secret (power-user info)
+    };
+  }
+
   // ---------------- base58check / WIF ----------------
   const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   function base58check(payload) {
@@ -171,5 +205,6 @@ const SECP = (() => {
   }
 
   return { P, N, GX, GY, mod, inv, mulG, pubkey, bigToBytes32, bytesToBig,
-           bech32mP2TR, sha256, base58check, wif, CHARSET };
+           bech32mP2TR, sha256, base58check, wif, CHARSET,
+           taggedHash, taptweak, taprootFromInternalPriv };
 })();

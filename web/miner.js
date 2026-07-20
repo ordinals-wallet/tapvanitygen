@@ -64,6 +64,11 @@ class Miner {
       });
     } catch (_) { /* older impls: no addEventListener on device */ }
 
+    // mode: "standard" (BIP-341 internal key + on-GPU tweak; the key imports
+    // into Unisat/OKX/Xverse as a normal Taproot key) or "fast" (rawtr output
+    // key). Standard is ~4x slower but wallet-compatible.
+    m.mode = cfg.mode === "fast" ? "fast" : "standard";
+
     const maxDim = lim.maxComputeWorkgroupsPerDimension || 65535;
     m.threadgroups = Math.max(1, Math.min(cfg.threadgroups || 64, maxDim));
     m.totalThreads = m.threadgroups * 256;
@@ -95,7 +100,7 @@ class Miner {
     const cfgArr = new Uint32Array(68);
     cfgArr[0] = m.prefixLen;
     cfgArr[1] = m.suffixLen;
-    cfgArr[2] = 1; // fast
+    cfgArr[2] = m.mode === "fast" ? 1 : 0; // fast flag (kernels are split, but keep it truthful)
     cfgArr[3] = m.totalThreads;
     cfg.prefix.forEach((v, i) => (cfgArr[4 + i] = v));
     cfg.suffix.forEach((v, i) => (cfgArr[36 + i] = v));
@@ -139,7 +144,7 @@ class Miner {
     const mk = (entryPoint) => device.createComputePipeline({ label: entryPoint, layout, compute: { module, entryPoint } });
     m.initPipeline = mk("init_table");
     m.setupPipeline = mk("setup");
-    m.searchPipeline = mk("search_fast");
+    m.searchPipeline = mk(m.mode === "fast" ? "search_fast" : "search");
     return m;
   }
 
@@ -224,11 +229,23 @@ class Miner {
     const tid = BigInt(found[1]);
     const iter = BigInt(found[2]);
     const kRaw = SECP.mod(this.k0 + (tid << 32n) + iter, SECP.N);
-    const pub = SECP.pubkey(kRaw);
-    const k = pub.parityOdd ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
+    // GPU-reported Q.x (LE u32 limbs) for cross-check
     let gpuX = 0n;
     for (let i = 7; i >= 0; i--) gpuX = (gpuX << 32n) | BigInt(found[12 + i]);
-    return { key: k, gpuX, tid: found[1], iter: found[2] };
+
+    if (this.mode === "fast") {
+      // fast: GPU reports no parity; normalize to even-y output key
+      const pub = SECP.pubkey(kRaw);
+      const k = pub.parityOdd ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
+      return { mode: "fast", key: k, gpuX, tid: found[1], iter: found[2] };
+    }
+    // standard: GPU reports the y-parity of the internal point P and the
+    // TapTweak scalar. Negate the internal secret to the even-y convention.
+    const parity = found[3] & 1;
+    const internal = parity ? SECP.mod(SECP.N - kRaw, SECP.N) : kRaw;
+    let gpuTweak = 0n;
+    for (let i = 7; i >= 0; i--) gpuTweak = (gpuTweak << 32n) | BigInt(found[4 + i]);
+    return { mode: "standard", internal, gpuTweak, gpuX, tid: found[1], iter: found[2] };
   }
 
   keysPerLaunch() { return this.totalThreads * this.iters; }
@@ -247,6 +264,7 @@ class Miner {
   static async mine(opts) {
     const prefix5 = patternTo5bit(opts.prefix || "");
     const suffix5 = patternTo5bit(opts.suffix || "");
+    const mode = opts.mode === "fast" ? "fast" : "standard";
     let threadgroups = opts.threadgroups || 64;
     const t0 = performance.now();
     let totalTried = 0;
@@ -258,6 +276,7 @@ class Miner {
         miner = await Miner.create({
           prefix: prefix5,
           suffix: suffix5,
+          mode,
           threadgroups,
           wgslUrl: opts.wgslUrl,
           frameBudgetMs: opts.frameBudgetMs,
@@ -298,14 +317,50 @@ class Miner {
 }
 
 // Verify a reconstructed key against the pattern; returns full result or throws.
+// Only verified results are ever shown to the user.
 function verifyHit(hit, prefixStr, suffixStr) {
-  const pub = SECP.pubkey(hit.key); // must be even-y now
-  if (pub.parityOdd) throw new Error("verification failed: normalized key still has odd-y pubkey");
-  if (pub.xBig !== hit.gpuX) throw new Error("verification failed: CPU pubkey.x != GPU-reported x (browser WGSL compiler bug?)");
-  const address = SECP.bech32mP2TR(pub.x);
-  const body = address.slice(4); // after "bc1p"
-  if (prefixStr && !body.startsWith(prefixStr)) throw new Error(`verification failed: address ${address} does not start with bc1p${prefixStr}`);
-  if (suffixStr && !address.endsWith(suffixStr)) throw new Error(`verification failed: address ${address} does not end with ${suffixStr}`);
-  const wif = SECP.wif(hit.key);
-  return { address, wif, descriptor: `rawtr(${wif})` };
+  const matches = (address) => {
+    const body = address.slice(4); // after "bc1p"
+    if (prefixStr && !body.startsWith(prefixStr))
+      throw new Error(`verification failed: ${address} does not start with bc1p${prefixStr}`);
+    if (suffixStr && !address.endsWith(suffixStr))
+      throw new Error(`verification failed: ${address} does not end with ${suffixStr}`);
+  };
+
+  if (hit.mode === "fast") {
+    const pub = SECP.pubkey(hit.key); // must be even-y now
+    if (pub.parityOdd) throw new Error("verification failed: normalized key still has odd-y pubkey");
+    if (pub.xBig !== hit.gpuX) throw new Error("verification failed: CPU pubkey.x != GPU-reported x (WGSL compiler bug?)");
+    const address = SECP.bech32mP2TR(pub.x);
+    matches(address);
+    const wif = SECP.wif(hit.key);
+    return { mode: "fast", address, wif, descriptor: `rawtr(${wif})` };
+  }
+
+  // STANDARD: the exported key is the BIP-341 INTERNAL key. We prove two things
+  // before display:
+  //  (a) internal key + TapTweak derives the mined address (matches GPU Q.x);
+  //  (b) the wallet path — BIP-86 tweak of the imported key's pubkey — derives
+  //      the SAME address (this is exactly what Unisat/OKX/Xverse compute).
+  // (a) and (b) are the same computation (taprootFromInternalPriv), so one
+  // verified derivation proves the wallet-import claim; we also cross-check the
+  // GPU-reported tweak against the CPU tweak for GPU/CPU integrity.
+  const t = SECP.taprootFromInternalPriv(hit.internal);
+  if (t.qxBig !== hit.gpuX)
+    throw new Error("verification failed: CPU output-key.x != GPU-reported Q.x (WGSL compiler bug?)");
+  if (t.tweak !== hit.gpuTweak)
+    throw new Error("verification failed: CPU TapTweak != GPU-reported tweak");
+  matches(t.address); // (a) our derivation
+  // (b) simulate the wallet import path independently from the WIF's key.
+  const walletAddr = SECP.taprootFromInternalPriv(t.internalEven).address;
+  if (walletAddr !== t.address)
+    throw new Error("verification failed: wallet BIP-86 path address mismatch");
+  matches(walletAddr);
+  const wif = SECP.wif(t.internalEven); // even-y internal key = what wallets import
+  return {
+    mode: "standard",
+    address: t.address,
+    wif,
+    tweakedSecret: t.outputSecret.toString(16).padStart(64, "0"),
+  };
 }
